@@ -2,60 +2,254 @@ package kcl_parse_file_issue
 
 import (
 	"encoding/json"
-	"kcl-lang.io/kcl-go/pkg/service"
+	"os"
 	"path"
 	"strconv"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"kcl-lang.io/kcl-go/pkg/3rdparty/dlopen"
 	"kcl-lang.io/kcl-go/pkg/native"
+	_ "kcl-lang.io/kcl-go/pkg/plugin/hello_plugin"
+	"kcl-lang.io/kcl-go/pkg/service"
 	"kcl-lang.io/kcl-go/pkg/spec/gpyrpc"
 )
 
+const sourceSimple = `v=option("foo")`
+const sourceWithPlugins = `
+import kcl_plugin.hello
+
+v=hello.add(option("foo"), 0)
+`
+
 func Test(t *testing.T) {
 	client := native.NewNativeServiceClient()
-	// Compile file
-	output := buildProgram(t, client)
-	require.NotEmpty(t, output)
 
+	threads := 10
 	t.Run("serial execution", func(t *testing.T) {
+		// Compile file
+		binary := buildProgram(t, client, sourceSimple)
+		require.NotEmpty(t, binary)
+		// Run
 		for i := 0; i < 1000; i++ {
-			checkExecute(t, client, output, int64(i))
+			checkExecute(t, client, binary, int64(i))
 		}
 	})
-	t.Run("parallel execution", func(t *testing.T) {
-		var wg sync.WaitGroup
-		threads := 10
-		wg.Add(threads)
-		c := make(chan int64, threads*10)
-		for i := 0; i < threads; i++ {
-			go func() {
-				defer wg.Done()
-				for id := range c {
-					checkExecute(t, client, output, id)
-				}
-			}()
-		}
+	t.Run("serial execution (plugins)", func(t *testing.T) {
+		// Compile file
+		binary := buildProgram(t, client, sourceWithPlugins)
+		require.NotEmpty(t, binary)
+		// Run
 		for i := 0; i < 1000; i++ {
-			c <- int64(i)
+			checkExecute(t, client, binary, int64(i))
 		}
-		close(c)
-		wg.Wait()
+	})
+	t.Run("serial execution (dlopen)", func(t *testing.T) {
+		// Compile file
+		binary := buildProgram(t, client, sourceSimple)
+		require.NotEmpty(t, binary)
+
+		// Load
+		handle, err := dlopen.GetHandle([]string{binary})
+		require.NoError(t, err)
+		defer handle.Close()
+
+		// Run
+		for i := 0; i < 1000; i++ {
+			checkExecute(t, client, binary, int64(i))
+		}
+	})
+	t.Run("serial execution (dlopen, plugins)", func(t *testing.T) {
+		// Compile file
+		binary := buildProgram(t, client, sourceWithPlugins)
+		require.NotEmpty(t, binary)
+
+		// Load
+		handle, err := dlopen.GetHandle([]string{binary})
+		require.NoError(t, err)
+		defer handle.Close()
+
+		// Run
+		for i := 0; i < 1000; i++ {
+			checkExecute(t, client, binary, int64(i))
+		}
+	})
+	t.Run("parallel parse", func(t *testing.T) {
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			for i := 0; i < 1000; i++ {
+				checkParse(t, client, sourceSimple)
+			}
+		})
+	})
+	t.Run("parallel execution (multiple binaries)", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(threads)
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			binary := func() string {
+				defer wg.Done()
+				res := buildProgram(t, client, sourceSimple)
+				require.NotEmpty(t, res)
+				return res
+			}()
+			t.Logf("compiled: %d, %s", thread, binary)
+
+			wg.Wait()
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkExecute(t, client, binary, int64(i))
+			}
+			t.Logf("done: %d", thread)
+		})
+	})
+	t.Run("parallel execution (multiple binaries, dlopen)", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(threads)
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			binary, handle := func() (string, *dlopen.LibHandle) {
+				defer wg.Done()
+				binary := buildProgram(t, client, sourceSimple)
+				require.NotEmpty(t, binary)
+
+				handle, err := dlopen.GetHandle([]string{binary})
+				require.NoError(t, err)
+				return binary, handle
+			}()
+			defer handle.Close()
+			t.Logf("compiled: %d, %s", thread, binary)
+
+			wg.Wait()
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkExecute(t, client, binary, int64(i))
+			}
+			t.Logf("done: %d", thread)
+		})
+	})
+	t.Run("parallel execution (multiple binaries, plugins)", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(threads)
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			binary := func() string {
+				defer wg.Done()
+				binary := buildProgram(t, client, sourceWithPlugins)
+				require.NotEmpty(t, binary)
+				return binary
+			}()
+			t.Logf("compiled: %d, %s", thread, binary)
+
+			wg.Wait()
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkExecute(t, client, binary, int64(i))
+			}
+			t.Logf("done: %d", thread)
+		})
+	})
+	t.Run("parallel execution (single binary, copy)", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(threads)
+		output := buildProgram(t, client, sourceSimple)
+		require.NotEmpty(t, output)
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			binary, handle := func() (string, *dlopen.LibHandle) {
+				defer wg.Done()
+				res := path.Join(t.TempDir(), path.Base(output))
+
+				file, err := os.ReadFile(output)
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(res, file, 0755))
+
+				handle, err := dlopen.GetHandle([]string{res})
+				require.NoError(t, err)
+				return res, handle
+			}()
+			defer handle.Close()
+			t.Logf("linked: %d, %s", thread, binary)
+
+			wg.Wait()
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkExecute(t, client, binary, int64(i))
+			}
+		})
+	})
+	t.Run("parallel execution (single binary, link)", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(threads)
+		binary := buildProgram(t, client, sourceSimple)
+		require.NotEmpty(t, binary)
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			binary := func() string {
+				defer wg.Done()
+				res := path.Join(t.TempDir(), path.Base(binary))
+				require.NoError(t, os.Link(binary, res))
+				return res
+			}()
+			t.Logf("linked: %d, %s", thread, binary)
+
+			wg.Wait()
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkExecute(t, client, binary, int64(i))
+			}
+		})
+	})
+	t.Run("parallel execution (single binary)", func(t *testing.T) {
+		binary := buildProgram(t, client, sourceSimple)
+		require.NotEmpty(t, binary)
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			for i := 0; i < 1000; i++ {
+				checkExecute(t, client, binary, int64(i))
+			}
+		})
+	})
+	t.Run("parallel execution (single binary, dlopen)", func(t *testing.T) {
+		binary := buildProgram(t, client, sourceSimple)
+		require.NotEmpty(t, binary)
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			handle, err := dlopen.GetHandle([]string{binary})
+			require.NoError(t, err)
+			defer handle.Close()
+
+			for i := 0; i < 1000; i++ {
+				checkExecute(t, client, binary, int64(i))
+			}
+		})
 	})
 }
 
-func buildProgram(t *testing.T, client service.KclvmService) string {
+func multithreadCheck(t *testing.T, threads int, check func(t *testing.T, thread int)) {
+	var wg sync.WaitGroup
+	wg.Add(threads)
+	for i := 0; i < threads; i++ {
+		thread := i
+		go func() {
+			defer wg.Done()
+			check(t, thread)
+		}()
+	}
+	wg.Wait()
+}
+
+func buildProgram(t *testing.T, client service.KclvmService, source string) string {
 	tempDir := t.TempDir()
 	result, err := client.BuildProgram(&gpyrpc.BuildProgram_Args{
 		ExecArgs: &gpyrpc.ExecProgram_Args{
 			KFilenameList: []string{"source.k"},
-			KCodeList:     []string{`v=option("foo")`},
+			KCodeList:     []string{source},
 		},
 		Output: path.Join(tempDir, "kcl"),
 	})
 	require.NoError(t, err, "BuildProgram returns error")
 	return result.Path
+}
+
+func checkParse(t *testing.T, client service.KclvmService, source string) {
+	_, err := client.ParseFile(&gpyrpc.ParseFile_Args{
+		Source: source,
+	})
+	require.NoError(t, err, "ParseFile returns errors")
 }
 
 func checkExecute(t *testing.T, client service.KclvmService, output string, id int64) {

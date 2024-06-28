@@ -2,28 +2,35 @@ package kcl_parse_file_issue
 
 import (
 	"encoding/json"
-	"os"
-	"path"
-	"strconv"
-	"sync"
-	"testing"
-
 	"github.com/stretchr/testify/require"
 	"kcl-lang.io/kcl-go/pkg/3rdparty/dlopen"
 	"kcl-lang.io/kcl-go/pkg/native"
 	_ "kcl-lang.io/kcl-go/pkg/plugin/hello_plugin"
 	"kcl-lang.io/kcl-go/pkg/service"
 	"kcl-lang.io/kcl-go/pkg/spec/gpyrpc"
+	"os"
+	"path"
+	"strconv"
+	"sync"
+	"testing"
 )
 
-const sourceSimple = `v=option("foo")`
+const sourceSimple = `
+v=option("foo")
+`
+const sourceRegex = `
+import regex
+
+v=option("foo")
+x=regex.match("foo", "^\\w+$")
+`
 const sourceWithPlugins = `
 import kcl_plugin.hello
 
 v=hello.add(option("foo"), 0)
 `
 
-func Test(t *testing.T) {
+func TestExecArtifact(t *testing.T) {
 	client := native.NewNativeServiceClient()
 
 	threads := 10
@@ -219,6 +226,45 @@ func Test(t *testing.T) {
 	})
 }
 
+func TestFastEval(t *testing.T) {
+	client := native.NewNativeServiceClient()
+
+	threads := 10
+	t.Run("serial execution", func(t *testing.T) {
+		// Run
+		for i := 0; i < 1000; i++ {
+			checkFastEval(t, client, int64(i), sourceSimple)
+		}
+	})
+	t.Run("parallel execution (simple)", func(t *testing.T) {
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkFastEval(t, client, int64(i), sourceSimple)
+			}
+			t.Logf("done: %d", thread)
+		})
+	})
+	t.Run("parallel execution (regex)", func(t *testing.T) {
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkFastEval(t, client, int64(i), sourceRegex)
+			}
+			t.Logf("done: %d", thread)
+		})
+	})
+	t.Run("parallel execution (plugins)", func(t *testing.T) {
+		multithreadCheck(t, threads, func(t *testing.T, thread int) {
+			t.Logf("run: %d", thread)
+			for i := 0; i < 1000; i++ {
+				checkFastEval(t, client, int64(i), sourceWithPlugins)
+			}
+			t.Logf("done: %d", thread)
+		})
+	})
+}
+
 func multithreadCheck(t *testing.T, threads int, check func(t *testing.T, thread int)) {
 	var wg sync.WaitGroup
 	wg.Add(threads)
@@ -256,7 +302,7 @@ func checkExecute(t *testing.T, client service.KclvmService, output string, id i
 	value := strconv.FormatInt(id, 10)
 	result, err := client.ExecArtifact(&gpyrpc.ExecArtifact_Args{
 		ExecArgs: &gpyrpc.ExecProgram_Args{
-			Args: []*gpyrpc.CmdArgSpec{{
+			Args: []*gpyrpc.Argument{{
 				Name:  "foo",
 				Value: value,
 			}},
@@ -264,12 +310,40 @@ func checkExecute(t *testing.T, client service.KclvmService, output string, id i
 		Path: output,
 	})
 	require.NoError(t, err, "ExecArtifact returns errors")
+	require.Empty(t, result.ErrMessage)
 
 	var config struct {
 		V int64 `json:"v"`
 	}
 	err = json.Unmarshal([]byte(result.JsonResult), &config)
-	require.NoError(t, err, "Can't parse configuration")
+	if err != nil {
+		require.NoError(t, err, "Can't parse configuration: %v", result.JsonResult)
+	}
+
+	require.Equal(t, id, config.V)
+}
+
+func checkFastEval(t *testing.T, client service.KclvmService, id int64, source string) {
+	value := strconv.FormatInt(id, 10)
+	result, err := client.ExecProgram(&gpyrpc.ExecProgram_Args{
+		KFilenameList: []string{"source.k"},
+		KCodeList:     []string{source},
+		Args: []*gpyrpc.Argument{{
+			Name:  "foo",
+			Value: value,
+		}},
+		FastEval: true,
+	})
+	require.NoError(t, err, "ExecProgram returns errors")
+	require.Empty(t, result.ErrMessage)
+
+	var config struct {
+		V int64 `json:"v"`
+	}
+	err = json.Unmarshal([]byte(result.JsonResult), &config)
+	if err != nil {
+		require.NoError(t, err, "Can't parse configuration: %v", result.JsonResult)
+	}
 
 	require.Equal(t, id, config.V)
 }
